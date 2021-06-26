@@ -1,0 +1,386 @@
+---
+title: "Lista 2 - Modelos preditivos"
+output:
+  html_document:
+    df_print: paged
+    code_folding: hide
+---
+
+## Objetivo
+
+Este projeto utilizará dados de entrevistas realizadas para uma pesquisa de satisfação e qualidade sob a visão dos clientes, a respeito à prestação de Serviço Móvel pessoal (telefonia móvel e banda larga móvel), considerando apenas a modalidade de serviço pré-paga. (fonte dos dados e questionário da pesquisa: http://dados.gov.br/dataset/banco-de-dados-da-pesquisa- telefonia-movel-pre-paga).
+
+Consideraremos a seguinte questão:
+
+
+** Nível de satisfação geral do entrevistado com a prestadora citada, levando em conta toda a experiência com esta ** 
+
+
+## Bibliotecas/Setup
+```{r}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  cache = TRUE,
+  error = FALSE,
+  message = FALSE,
+  warning = FALSE
+  
+)
+```
+
+
+```{r}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(ggplot2)
+library(dplyr)
+library(MASS)
+library(glmnet)
+library(vip)
+library(gapminder)
+library(pROC)
+library(class)
+library(caret)
+library(rsample)
+library(class)
+library(parallel)
+library(doParallel)
+library(rpart)
+library(rpart.plot)
+library(patchwork)
+library(ranger)
+```
+
+## Carregamento dos dados
+```{r}
+data <- read.csv('./data-treated.csv')
+data <- data[,-1]
+
+# transformando a variável dependente em fator
+
+data$J1 <- factor(data$J1)
+
+
+
+variaveis <- names(data)
+
+for (f in variaveis){
+  data[[f]] <- factor(data[[f]])
+}
+```
+
+
+
+```{r}
+set.seed(213)
+
+splits = initial_split(data, prop = .8, strata = J1)
+
+# Defining our training and test sets
+train <- training(splits)
+test <- testing(splits)
+
+```
+
+> As colunas que serão consideradas para o modelo seguem abaixo:
+
+```{r}
+make.names(colnames(data))
+```
+
+```{r}
+ as.data.frame(table(data$J1))
+```
+
+> Preparando a tibble que guardará o melhor corte de cada um dos modelos utilizados e suas respectivas acurácias
+
+```{r}
+
+resultados <- tibble(modelo = c("knn", "lr", "tree", "rf"),
+                     accuracy = NA, corte = NA, fscore = NA, fbeta = NA )
+```
+
+* Modelo Logístico
+
+```{r, cache=TRUE}
+
+cl <- makePSOCKcluster(4)
+registerDoParallel(cl)
+
+lr_fit <- glm(J1 ~ ., data = train, family = "binomial")
+
+lr_pred <- predict(lr_fit, test, type="response")
+
+summary(lr_pred)
+stopCluster(cl)
+```
+
+> Avaliando a curva as métricas obtidas pelo modelo logístico
+
+```{r, cache=TRUE}
+
+roc_fit <- roc(test$J1, lr_pred)
+
+coords_lr <- coords(roc_fit, ret = "all", transpose = FALSE) %>%
+  mutate(metodo = "logistica") %>%
+  mutate(fbeta = ((1.25 * specificity * sensitivity) / (0.25 * specificity + sensitivity))) %>% 
+  mutate(fscore= (2 * specificity * sensitivity) / (specificity + sensitivity)) %>% 
+  arrange(desc(fbeta))
+
+```
+
+> O corte com melhor fbeta foi 0.53. Guardaremos este resultado em nossa tibble, contendo o *threshold*, *accuracy*, *fscore*, *fbeta*
+
+```{r}
+resultados$corte[resultados$modelo == 'lr'] = coords_lr$threshold[1]
+resultados$accuracy[resultados$modelo == 'lr'] = coords_lr$accuracy[1]
+resultados$fscore[resultados$modelo == 'lr'] = coords_lr$fscore[1]
+resultados$fbeta[resultados$modelo == 'lr'] = coords_lr$fbeta[1]
+resultados
+```
+
+* KNN
+
+> Testaremos diferentes valores de k, partindo de 1 até 20, para encontrarmos o valor de k que obtém os melhores resultados.
+
+```{r, cache = TRUE, eval=FALSE}
+cl <- makePSOCKcluster(4) 
+registerDoParallel(cl)
+
+idx <- sample(seq(1, nrow(train)) %% 5)
+
+knn_resultados <- as.data.frame(tibble(k = seq(1, 20, 1), accuracy = NA, fscore = NA, fbeta = NA, threshold = NA))
+
+for (i in 1:nrow(knn_resultados)) {
+  metrics <- as.data.frame(tibble(k = NA, acc = NA, fbeta = NA, threshold = NA, fscore = NA))
+  
+  for (k in 0:4) {
+    train_k <- train[idx != k,]
+    test_k <- train[idx == k,]
+    
+      fit_knn <- knn(
+        train = train_k,
+        test = test_k,
+        cl = train_k$J1,
+        prob = TRUE,
+        k = i
+      )
+      
+      prob_knn <- attr(fit_knn, "prob")
+      
+      knn_roc <- roc(response = test_k$J1, predictor = prob_knn, type = "prob")
+      
+      coords_knn <- coords(knn_roc, ret = "all", transpose = FALSE) %>%
+        mutate(metodo = "knn") %>%
+        mutate(fbeta = ((1.25 * specificity * sensitivity) / (0.25 * specificity + sensitivity))) %>% 
+        mutate(fscore = (2 * specificity * sensitivity) / (specificity + sensitivity)) %>%
+        arrange(desc(fbeta))
+      
+      metrics[k + 1, "k"] <- k
+      metrics[k + 1, "fbeta"] <- coords_knn$fbeta[1]
+      metrics[k + 1, "fscore"] <- coords_knn$fscore[1]
+      metrics[k + 1, "acc"] <- coords_knn$acc[1]
+      metrics[k + 1, "threshold"] <- coords_knn$threshold[1]
+  }
+  
+    knn_resultados[i, "accuracy"] <- mean(metrics$acc)
+    knn_resultados[i, "threshold"] <- mean(metrics$threshold)
+    knn_resultados[i, "fbeta"] <- mean(metrics$fbeta)
+    knn_resultados[i, "fscore"] <- mean(metrics$fscore)
+}
+
+stopCluster(cl)
+
+knn_resultados %>% 
+  arrange(desc(fbeta))
+```
+
+* Visualizando os resultados em um gráfico
+
+> Fbeta
+
+```{r, eval=FALSE}
+
+ggplot(knn_resultados, aes(x = k, y = fbeta, label = round(fbeta, digits = 2))) +
+  geom_line() + 
+  geom_point(size = 1) + 
+  geom_label() +
+  ggtitle('Resultados obtidos de fbeta para cada valor de k') + 
+  xlab("K") + ylab("Fbeta") + geom_text(check_overlap = TRUE, size = 4)
+
+```
+
+> Acurácia
+
+```{r, cache = TRUE, eval=FALSE}
+
+ggplot(knn_resultados, aes(x = k, y = accuracy, label = round(accuracy, digits = 2))) +
+  geom_line() + 
+  geom_point(size = 1) + 
+  geom_label() +
+  ggtitle('Resultados obtidos de fbeta para cada valor de k') + 
+  xlab("K") + ylab("Acurácia") + geom_text(check_overlap = TRUE, size = 4)
+```
+> O melhor fbeta obtido foi com k = 20, sendo 0,69 enquanto sua acurácia é de 0,58. Guardaremos este resultado em nossa tabela:
+
+```{r, eval=FALSE}
+knn_resultados <- knn_resultados %>%  
+  arrange(desc(fbeta))
+
+resultados$corte[resultados$modelo == 'knn'] = knn_resultados$threshold[1]
+resultados$accuracy[resultados$modelo == 'knn'] = knn_resultados$accuracy[1]
+resultados$fscore[resultados$modelo == 'knn'] = knn_resultados$fscore[1]
+resultados$fbeta[resultados$modelo == 'knn'] = knn_resultados$fbeta[1]
+
+resultados
+```
+
+*  Árvore de classificação
+
+```{r, cache=TRUE}
+
+cl <- makePSOCKcluster(4) 
+registerDoParallel(cl)
+
+  ctree <- rpart(J1 ~ ., data=train, control = rpart.control(minsplit = 1, cp = 0))
+  
+  rpart.plot(ctree)
+    
+  tree_pred <- predict(ctree, test, type = "prob")[,2]
+  
+  tree_roc <- roc(response = test$J1, predictor = tree_pred)
+  
+  coords_tree <- coords(tree_roc, ret = "all", transpose = FALSE) %>%
+      mutate(metodo = "arvore") %>%
+      mutate(fbeta = ((1.25 * specificity * sensitivity) / (0.25 * specificity + sensitivity))) %>% 
+      mutate(fscore= (2 * specificity * sensitivity) / (specificity + sensitivity)) %>%
+      arrange(desc(fbeta))
+   
+  coords_tree
+
+stopCluster(cl)
+
+```
+
+> Guardando as medidas de desempenho com o valor de corte que obtém o melhor valor para fbeta:
+
+```{r}
+resultados$fbeta[resultados$modelo == "tree"] <- coords_tree$fbeta[1]
+resultados$fscore[resultados$modelo == "tree"] <- coords_tree$fscore[1]
+resultados$accuracy[resultados$modelo == "tree"] <- coords_tree$accuracy[1]
+resultados$corte[resultados$modelo == "tree"] <- coords_tree$threshold[1]
+
+resultados
+```
+
+
+* Random forest
+
+```{r, cache=TRUE, eval=FALSE}
+cl <- makePSOCKcluster(4)
+registerDoParallel(cl)
+
+idx <- sample(seq(1, nrow(train)) %% 10)
+ntrees <- seq(10, 1000, 10)
+
+rf <- ranger(J1 ~ ., data=train, 
+             probability = TRUE, 
+             sample.fraction = .8, 
+             importance = "impurity",
+             )
+
+rf_pred <- predict(rf, test)$predictions[,2]
+
+rf_roc <- roc(response = test$J1, predictor = rf_pred, type = "prob")
+
+coords_rf <- coords(rf_roc, ret = "all", transpose = FALSE) %>%
+  mutate(metodo = "randomforest") %>%
+  mutate(fbeta = ((1.25 * specificity * sensitivity) / (0.25 * specificity + sensitivity))) %>% 
+  mutate(fscore = (2 * specificity * sensitivity) / (specificity + sensitivity)) %>%
+  arrange(desc(fbeta))
+
+stopCluster(cl)
+
+resultados$accuracy[resultados$modelo == "rf"] <- coords_rf$accuracy[1]
+resultados$fbeta[resultados$modelo == "rf"] <- coords_rf$fbeta[1]
+resultados$fscore[resultados$modelo == "rf"] <- coords_rf$fscore[1]
+resultados$corte[resultados$modelo == "rf"] <- coords_rf$threshold[1]
+
+```
+
+> Avaliando cada uma das medidas de desempenho obtidas pelo Random Forest
+
+* Fbeta
+
+```{r, eval=FALSE}
+ggplot(coords_rf, aes(x = threshold, y = fbeta, label = round(fbeta, digits = 2))) +
+  geom_line() + 
+  geom_point(size = .5) + 
+  ggtitle('Acurácia para cada valor de corte') + 
+  xlab("Corte") + ylab("Acurácia")
+```
+
+
+
+# Avaliando a curva ROC de cada um dos modelos:
+
+```{r, eval=FALSE}
+{plot(roc_fit, print.auc = TRUE, print.auc.x = .5, print.auc.y = .4, col = "blue", xlab = "Porcentagem de Falso Positivo",
+     ylab = "Porcentagem de Verdadeiros Positivos")
+#plot(knn_roc, add = TRUE, print.auc = TRUE, print.auc.x = .5, print.auc.y = .3, col = "red")
+plot(rf_roc, add = TRUE, print.auc = TRUE, print.auc.x = .5, print.auc.y = .2, col = "purple")
+legend("bottomright", c("Regressão logística", "KNN", "Random Forest"),
+       col = c("blue", "red", "purple"),
+       lwd = 1,
+         cex=0.8
+       )
+}
+
+```
+
+
+# Avaliando a importância das variáveis
+
+```{r}
+
+lr_imp <- vip(lr_fit, aesthetics = list(fill = "dodgerblue"))
+lr_rf <- vip(rf, aesthetics = list(fill = "dodgerblue")) 
+
+
+grid.arrange(lr_imp, lr_rf, nrow = 1, ncol=2, widths = c(10, 10))
+```
+
+A variável de maior importância para os ambos modelos comparados foi a facilidade de entendimento dos planos e serviços contratados, nos levando a acreditar que os participantes consideram que a transparência por parte do que é oferecido pelas operadoras de telefonia é o fator mais relevante para a satisfação do cliente. Em seguida, para o modelo logístico, temos: 
+
+2. qualidade da ligação *(C1_2)*;
+3. clareza de informações na conta *(E1_2)*;
+4. a ausência de uma operadora que ofereça o mesmo serviço da atual;
+5. *(G1_2)*, valores disponíveis para recarga *(E1_3)*;
+6. capacidade de acessar 3G/4G sempre que preciso *(D2_1)*;
+7. qualidade do atendimento telefônico da operadora *(A3)*;
+8. cobrança dos valores de acordo com o contratado *(E1_1)*;
+9. capacidade de manter a conexão sem quedas *(D2_2)*;
+10. velocidade de navegação *(D2_2)*;
+
+Para o Random Forest, temos:
+
+2. a ausência de uma operadora que ofereça o mesmo serviço da atual;
+3. clareza de informações na conta *(E1_2)*;
+4. cobrança dos valores de acordo com o contratado *(E1_1)*;
+5. *(G1_2)*, valores disponíveis para recarga *(E1_3)*;
+6. capacidade de acessar 3G/4G sempre que preciso *(D2_1)*;
+7. capacidade de manter a conexão sem quedas *(D2_2)*;
+8. qualidade do atendimento telefônico da operadora *(A3)*;
+9. velocidade de navegação *(D2_2)*;
+
+
+Visualizando os resultados para obtermos o modelo com melhor valor obtido para *fbeta*:
+
+```{r}
+resultados %>% 
+  arrange(desc(fbeta))
+```
+
+O *Random Forest* foi o modelo que obteve o melhor valor de fbeta. Contudo, selecionaremos o modelo logístico devida a sua acurácia e fscore serem melhores em relação ao *Random Forest*. 
+
+
